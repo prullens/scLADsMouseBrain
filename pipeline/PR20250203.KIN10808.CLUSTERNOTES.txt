@@ -1,0 +1,334 @@
+###PR20250203
+
+## Project variables
+PROJECTNAME="invivo"; 
+LIMSID="KIN10808";
+
+mkdir -p /hpc/hub_kind/$USER/projects/$PROJECTNAME/$LIMSID;
+cd /hpc/hub_kind/$USER/projects/$PROJECTNAME/$LIMSID;
+mkdir data;
+mkdir data/raw;
+mkdir metadata; 
+mkdir bin;
+mkdir filelists;
+mkdir joblog;
+mkdir tmp;
+
+## get add_read_prefix.awk and run_preformatted_cmd.sh
+tutorial_file_folder="/hpc/hub_kind/koos/tmp/";
+tar -xvf ${tutorial_file_folder}/DamIDseq_tutorial_scripts.tar.gz;
+cp /hpc/hub_kind/prullens/projects/ESC/KIN3147/bin/run_preformatted_cmd_slurm.sh ./bin/;
+
+
+## creating library specific barcode files
+ANNOFN="./metadata/KIN10808_anno_mecp2dam126_damt.tsv";
+BCFN_FMT="./metadata/%s.index%02d.barcodes.tsv";
+DAMID_BCNAME_FMT="DamID2_BC_%03d";
+CELSEQ_BCNAME_FMT="CELseq2_BC_%03d";
+DAMID_FN="./metadata/KR180207_DamID2_384_set1.tsv"
+CELSEQ_FN="./metadata/KR180207_CELseq2_384_set2.tsv"
+
+tail -n+2 $ANNOFN | cut -f1 | sort | uniq | while read indexnr; do 
+    printf -v bcfile "$BCFN_FMT" "$LIMSID" $indexnr;
+    cat "$ANNOFN" | tail -n+2 | awk -v indexnr=$indexnr '$1 == indexnr {print($2)}' | while read damid_bcnr; do
+        printf -v bcstr "$DAMID_BCNAME_FMT" $damid_bcnr;
+        awk -v bcstr="$bcstr" '$1 == bcstr' "$DAMID_FN";
+    done > "$bcfile";
+    cat "$ANNOFN" | tail -n+2 | awk -v indexnr=$indexnr '$1 == indexnr {print($3)}' | while read celseq_bcnr; do
+        printf -v bcstr "$CELSEQ_BCNAME_FMT" $celseq_bcnr;
+        awk -v bcstr="$bcstr" '$1 == bcstr' "$CELSEQ_FN";
+    done >> "$bcfile";
+done;
+
+
+## demultiplexing
+taskname="demultiplex";
+filelist="./filelists/$(date +"%Y%m%d_%H%M").${taskname}.cmds.list";
+
+ANNOFN="./metadata/KIN10808_anno_mecp2dam126_damt.tsv";
+LIMSID=$LIMSID;
+INDIR="./tmp/";
+OUTDIR="./data/demultiplexed/";
+BASE_OUTFMT="${OUTDIR}/%s.index%02d";
+BCFN_FMT="./metadata/%s.index%02d.barcodes.tsv";
+
+tail -n+2 $ANNOFN | cut -f1 | sort | uniq | while read indexnr; do
+    printf -v bcfile "$BCFN_FMT" "$LIMSID" $indexnr;
+
+    fn1_infiles="";
+    fn2_infiles="";
+    for fn1 in $(ls ${INDIR}* | grep "i${indexnr}" | grep "R1_001.fastq.gz"); do
+        fn2="${fn1/%_R1_001.fastq.gz/_R2_001.fastq.gz}";
+        if ! [ -r "$fn2" ]; then
+            echo "Error! File not found or not readable: ${fn2}";
+            break;
+        fi;
+        fn1_infiles="${fn1_infiles} \"${fn1}\"";
+        fn2_infiles="${fn2_infiles} \"${fn2}\"";
+    done;
+    
+    if ! [ -r "$fn2" ]; then
+        echo "Error! File not found or not readable: ${fn2}";
+        break;
+    fi;
+
+    printf -v outbase "$BASE_OUTFMT" "$LIMSID" $indexnr;
+    outfmt="${outbase}.{name}.{readname}.fastq.gz";
+    ambiguous_outfmt="${outbase}.ambiguous.{readname}.fastq.gz";
+    unmatched_outfmt="${outbase}.unmatched.{readname}.fastq.gz";
+    stats_outfile="${outbase}.demultiplex_info.tsv";
+    errfile="${outbase}.demultiplex.err";
+
+    cmd="\
+        demultiplex \
+            -vvv \
+            -m 0 \
+            -o \"${outfmt}\" \
+            --unmatched-outfile \"${unmatched_outfmt}\" \
+            --ambiguous-outfile \"${ambiguous_outfmt}\" \
+            --infofile \"${stats_outfile}\" \
+            \"${bcfile}\" \
+            <( cat ${fn1_infiles} | gzip -dc ) <( cat ${fn2_infiles} | gzip -dc ) \
+            2> \"${errfile}\" \
+    ";
+
+    echo "$cmd";
+         
+done > "$filelist";
+
+mkdir -p "${OUTDIR}" || true; 
+
+sbatch -J $LIMSID.${taskname} -o './joblog/%A.task_%a.out' -e './joblog/%A.task_%a.err' --time=5:00:00 --mem=20G --array=1-4 ./bin/run_preformatted_cmd_slurm.sh "$filelist" $(cat $filelist | wc -l);
+#jobid 31320129
+
+
+## aligning DamID2 data to mm10
+taskname="align_damid2_data";
+filelist="./filelists/$(date +"%Y%m%d_%H%M").${taskname}.cmds.list";
+
+ANNOFN="./metadata/KIN10808_anno_mecp2dam126_damt.tsv";
+LIMSID=$LIMSID;
+FNFMT="./data/demultiplexed/$LIMSID.index%02d.DamID2_BC_%03d.R1.fastq.gz";
+OUTFNFMT="./data/aligned/$LIMSID.index%02d.DamID2_BC_%03d.sorted.bam";
+OUTDIR="./data/aligned/";
+BOWTIE2_INDEX="/hpc/hub_kind/koos/references/mouse/mm10/bowtie2/Mus_musculus.GRCm38.dna.primary_assembly.with_ERCC";
+PREFIX="GA";
+
+tail -n+2 $ANNOFN | cut -f1,2 | while read indexnr bcnr; do 
+    printf -v infiles $FNFMT $indexnr $bcnr;
+    
+    printf -v outfn "$OUTFNFMT" $indexnr $bcnr;
+    bowtie2_errfile="${outfn/%sorted.bam/bowtie2.err}";
+    samtools_sort_tmp="${outfn/%sorted.bam/samtools_sort_tmp}";
+
+    cmd="\
+        cat $infiles \
+        | gzip -dc \
+        | awk -f ./bin/add_read_prefix.awk -v PREFIX=\"${PREFIX}\" \
+        | bowtie2 \
+            --seed 42 \
+            --very-sensitive -N 1 \
+            -x \"${BOWTIE2_INDEX}\" \
+            -U - \
+            2> \"${bowtie2_errfile}\" \
+        | samtools view -ub - \
+        | samtools sort -m 500M -T \"${samtools_sort_tmp}\" -l 9 - \
+        > \"${outfn}\" \
+        ;";
+
+    echo "$cmd";   
+    
+done > "$filelist";
+
+mkdir -p "${OUTDIR}" || true; 
+
+sbatch -J $LIMSID.${taskname} -o './joblog/%A.task_%a.out' -e './joblog/%A.task_%a.err' --time=5:00:00 --mem=10G --array=1-16 ./bin/run_preformatted_cmd_slurm.sh "$filelist" $(cat $filelist | wc -l);
+#jobid 31332778
+
+
+## aligning CEL-seq2 data to mm10  
+taskname="align_celseq2_data";
+filelist="./filelists/$(date +"%Y%m%d_%H%M").${taskname}.cmds.list";
+
+ANNOFN="./metadata/KIN10808_anno_mecp2dam126_damt.tsv";
+LIMSID=$LIMSID
+INDIR="./data/demultiplexed/";
+INFILE_FMT="$INDIR/$LIMSID.index%02d.CELseq2_BC_%03d.R2.fastq.gz";
+OUTDIR="./data/aligned/";
+OUTBASE_FMT="${OUTDIR}/%s.index%02d.CELseq2_BC_%03d";
+REF_IDX="/hpc/hub_kind/koos/references/mouse/mm10/bowtie2/Mus_musculus.GRCm38.dna.primary_assembly.with_ERCC" 
+TX_GTF="/hpc/hub_kind/koos/references/mouse/mm10/transcriptome/release-89/tophat2/mm10.Mus_musculus.GRCm38.89.with_ERCC.gff"
+TX_IDX="/hpc/hub_kind/koos/references/mouse/mm10/transcriptome/release-89/tophat2/mm10.Mus_musculus.GRCm38.89.with_ERCC"
+NUMTHREADS=1;
+
+tail -n+2 $ANNOFN | cut -f1,3 | while read indexnr bcnr; do 
+    printf -v infile_pattern "$INFILE_FMT" $indexnr $bcnr;
+    
+    printf -v outbase "$OUTBASE_FMT" "$LIMSID" $indexnr $bcnr;
+    outdir="${outbase}.tophat2/";
+    th2_outfile="${outbase}.tophat2.out";
+    th2_errfile="${outbase}.tophat2.err";
+    
+    if [ ! -f ${outdir}/accepted_hits.bam ]; then
+    
+        cmd="\
+            tophat2 \
+                --GTF \"$TX_GTF\" \
+                --transcriptome-index \"$TX_IDX\" \
+                --segment-length 22 \
+                --read-mismatches 4 \
+                --read-edit-dist 4 \
+                --min-anchor 6 \
+                --min-intron-length 25\
+                --max-intron-length 25000 \
+                --no-novel-juncs \
+                --no-novel-indels \
+                --no-coverage-search \
+                --b2-very-sensitive \
+                --b2-N 1 \
+                --b2-gbar 200 \
+                --num-threads $NUMTHREADS \
+                --output-dir \"$outdir\" \
+                \"${REF_IDX}\" \
+                \"$infile_pattern\" \
+                > \"${th2_outfile}\" \
+                2> \"${th2_errfile}\" \
+        ;";
+
+        echo "$cmd";
+        
+    fi;
+    
+done > "$filelist";
+
+sbatch -J $LIMSID.${taskname} -o './joblog/%A.task_%a.out' -e './joblog/%A.task_%a.err' --time=25:00:00 --mem=20G --array=1-16 ./bin/run_preformatted_cmd_slurm.sh "$filelist" $(cat $filelist | wc -l);
+#jobid 31333043
+
+
+## counting DamID2 data
+taskname="count_damid_data";
+filelist="./filelists/$(date +"%Y%m%d_%H%M").${taskname}.cmds.list";
+
+ANNOFN="./metadata/KIN10808_anno_mecp2dam126_damt.tsv";
+INDIR="./data/aligned/";
+OUTDIR="./data/counts/";
+INFNFMT="${INDIR}/$LIMSID.index%02d.DamID2_BC_%03d.sorted.bam";
+ERRFNFMT="${OUTDIR}/$LIMSID.index%02d.DamID2_BC_%03d.event_counts.err";
+POSFILE="/hpc/hub_kind/koos/references/mouse/mm10/posarray/Mus_musculus.GRCm38.dna.primary_assembly.with_ERCC.GATC.posarray.hdf5"
+MIN_MAPQ=10;
+KEEPN=2; 
+
+tail -n+2 $ANNOFN | cut -f1,2 | while read indexnr bcnr; do 
+    printf -v fn "$INFNFMT" $indexnr $bcnr;
+    printf -v errfn "$ERRFNFMT" $indexnr $bcnr;
+    bn=$(basename "$fn");
+    b=${bn/%.sorted.bam/};
+    
+    
+    of="${OUTDIR}/${b}.top_n_${KEEPN}.event_counts.pos.hdf5";
+    of_invalid="${OUTDIR}/${b}.invalid_pos.sorted.bam";
+    
+    if [ ! -f $of ]; then
+    
+        cmd="\
+            write_counts_at_pos.py \
+                -vvv \
+                --umi-hamming-dist 1 \
+                --keepn $KEEPN \
+                --min-mapq $MIN_MAPQ \
+                --unique-event-outfile \"${of}\" \
+                --posfile \"${POSFILE}\" \
+                \"${fn}\" \
+                2> \"${errfn}\" \
+        ;";
+        
+        echo "$cmd";
+        
+    fi;
+    
+done > "$filelist";
+
+sbatch -J $LIMSID.${taskname} -o './joblog/%A.task_%a.out' -e './joblog/%A.task_%a.err' --time=5:00:00 --mem=10G --array=1-16 ./bin/run_preformatted_cmd_slurm.sh "$filelist" $(cat $filelist | wc -l);
+#jobid 31340804
+
+
+## counting CELseq2 data
+taskname="count_celseq_data";
+filelist="./filelists/$(date +"%Y%m%d_%H%M").${taskname}.cmds.list";
+
+ANNOFN="./metadata/KIN10808_anno_mecp2dam126_damt.tsv";
+LIMSID=$LIMSID;
+INDIR="./data/aligned/";
+INFILE_FMT="${INDIR}/%s.index%02d.CELseq2_BC_%03d.tophat2/accepted_hits.bam";
+OUTDIR="./data/counts/";
+ERRFNFMT="${OUTDIR}/$LIMSID.index%02d.CELseq2_BC_%03d.counts.err";
+OUTFILE_FMT="${OUTDIR}/%s.index%02d.CELseq2_BC_%03d.counts.hdf5";
+TX_GTF="/hpc/hub_kind/koos/references/mouse/mm10/transcriptome/release-89/tophat2/mm10.Mus_musculus.GRCm38.89.with_ERCC.gff"
+MIN_MAPQ=10; 
+
+tail -n+2 $ANNOFN | cut -f1,3 | while read indexnr bcnr; do
+    printf -v infn "$INFILE_FMT" "$LIMSID" $indexnr $bcnr;
+    printf -v outfn "$OUTFILE_FMT" "$LIMSID" $indexnr $bcnr; 
+    printf -v errfn "$ERRFNFMT" $indexnr $bcnr;
+    
+    cmd="\
+        python ./bin/count_abundance_genes_from_celseq2_data.py \
+            -vvv \
+            --gtf \"${TX_GTF}\" \
+            --mode intersection-strict \
+            --min-mapq ${MIN_MAPQ} \
+            --outfile \"${outfn}\" \
+            \"${infn}\" \
+            2> \"${errfn}\" \
+    ;";
+
+    echo "$cmd";
+    
+done > "$filelist";
+
+sbatch -J $LIMSID.${taskname} -o './joblog/%A.task_%a.out' -e './joblog/%A.task_%a.err' --time=8:00:00 --mem=15G --array=1-32 ./bin/run_preformatted_cmd_slurm.sh "$filelist" $(cat $filelist | wc -l);
+#jobid 31356081
+
+
+## bin DamID2 data
+taskname="bin_damid2_count_files";
+filelist="./filelists/$(date +"%Y%m%d_%H%M").${taskname}.cmds.list";
+
+ANNOFN="./metadata/KIN10808_anno_mecp2dam126_damt.tsv";
+LIMSID=$LIMSID;
+MAPFILE="/hpc/hub_kind/koos/references/mouse/mm10/mappability/Mus_musculus.GRCm38.dna.primary_assembly.with_ERCC.GATC.bowtie2_very_sensitive_N1.readlength_64.counts.pos.hdf5"
+POSFILE="/hpc/hub_kind/koos/references/mouse/mm10/posarray/Mus_musculus.GRCm38.dna.primary_assembly.with_ERCC.GATC.posarray.hdf5"
+INDIR="./data/counts/";
+OUTDIR="./data/counts/";
+BINSIZES="1000";
+FNFMT="${LIMSID}.index%02d.DamID2_BC_%03d.top_n_%d.event_counts.pos.hdf5"
+OUTFNFMT="${LIMSID}.index%02d.DamID2_BC_%03d.top_n_%d.event_counts.binsize_%d.hdf5"
+KEEPN=2;
+
+tail -n+2 $ANNOFN | cut -f1,2 | while read indexnr barcodenr; do
+    for binsize in $BINSIZES; do
+        printf -v outfn "${OUTDIR}/${OUTFNFMT}" $indexnr $barcodenr $KEEPN $binsize;
+        printf -v fn "${INDIR}/${FNFMT}" $indexnr $barcodenr $KEEPN;
+        
+        if [ ! -f $outfn ]; then
+        
+            cmd="\
+                bin_countfile.py \
+                    -vvv \
+                    --keepn $KEEPN \
+                    --mapfile \"${MAPFILE}\" \
+                    --posfile \"${POSFILE}\" \
+                    --binsize ${binsize} \
+                    --outfile \"${outfn}\" \
+                    \"${fn}\" \
+            ;";
+
+            echo "$cmd";
+        
+        fi;
+        
+    done
+    
+done > "$filelist";
+
+sbatch -J $LIMSID.${taskname} -o './joblog/%A.task_%a.out' -e './joblog/%A.task_%a.err' --time=2:00:00 --mem=10G --array=1-32 ./bin/run_preformatted_cmd_slurm.sh "$filelist" $(cat $filelist | wc -l);
