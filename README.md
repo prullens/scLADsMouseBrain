@@ -6,7 +6,7 @@ ___
 
 ### **pre-print:**
 
-MeCP2 binding and genome–lamina reorganization precede long gene activation during mouse corticogenesis
+**MeCP2 binding and genome–lamina reorganization precede long gene activation during mouse corticogenesis**
 
 Pim M. J. Rullens*, Sandra S. de Vries*, Silke J. A. Lochs*, Corina M. Markodimitraki, Keith M. Garner, Youri Adolfs, Hegias Mira-Bontenbal, Micha M. Müller, Elisa Bugani, Marvin E. Tanenbaum, Joost Gribnau, Onur Basak# and Jop Kind#
 
